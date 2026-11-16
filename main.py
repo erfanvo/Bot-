@@ -43,9 +43,13 @@ ALLOWED_USER_IDS = [
     int(x.strip()) for x in re.split(r"[,\s]+", allowed_users_env) if x.strip().isdigit()
 ]
 
+# اگر REQUIRE_PARTNER_CODE برابر false باشد، بدون کد اشتراک هم می‌توان لایسنس ساخت؛ به صورت پیش‌فرض برای امنیت سهمیه فعال است
+REQUIRE_PARTNER_CODE = os.getenv("REQUIRE_PARTNER_CODE", "true").lower() != "false"
+
 REDIS_URL = os.getenv("REDIS_URL")
 PORT = int(os.getenv("PORT", 8000))
 REDIS_PREFIX = "snapp:license:"
+PARTNER_PREFIX = "snapp:partner:"
 
 # --- اتصال به ردیس ---
 redis_client = None
@@ -74,9 +78,13 @@ def get_redis():
 get_redis()
 
 
-# --- تولید لایسنس با پیشوند دقیق Snapp ---
+# --- تولید لایسنس با پیشوند دقیق Snapp و کد اشتراک همکار ---
 def generate_snapp_license() -> str:
     return f"Snapp-{str(uuid.uuid4())[:8].upper()}-{str(uuid.uuid4())[:8].upper()}"
+
+
+def generate_partner_code() -> str:
+    return f"SUB-{str(uuid.uuid4())[:6].upper()}"
 
 
 def normalize_license_key(raw_key: str) -> str:
@@ -105,6 +113,42 @@ def find_redis_key_for_license(raw_key: str):
         if val:
             return rk, val
     return None, None
+
+
+def get_partner_record(partner_code: str):
+    db = get_redis()
+    if not db or not partner_code:
+        return None, None
+    clean_code = partner_code.strip().upper()
+    rk = f"{PARTNER_PREFIX}{clean_code}"
+    raw = db.get(rk)
+    if not raw:
+        return None, None
+    try:
+        return rk, json.loads(raw)
+    except Exception:
+        return None, None
+
+
+def fetch_all_partners() -> list:
+    db = get_redis()
+    if not db:
+        return []
+    keys = db.keys(f"{PARTNER_PREFIX}*")
+    if not keys:
+        return []
+    partners = []
+    try:
+        for raw in db.mget(keys):
+            if raw:
+                try:
+                    partners.append(json.loads(raw))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    partners.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return partners
 
 
 def normalize_iran_phone(raw_phone: str) -> str:
@@ -191,21 +235,22 @@ def kb_snapp_admin() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📊 آمار و وضعیت دیتابیس", callback_data="snapp_stats"),
-            InlineKeyboardButton("📋 لیست لایسنس و شماره‌ها", callback_data="snapp_list_inline"),
+            InlineKeyboardButton("👥 مدیریت سهمیه دوستان", callback_data="snapp_partners"),
         ],
         [
+            InlineKeyboardButton("📋 لیست لایسنس و شماره‌ها", callback_data="snapp_list_inline"),
             InlineKeyboardButton("📄 گزارش لایسنس + شماره (TXT)", callback_data="snapp_export_pairs"),
+        ],
+        [
             InlineKeyboardButton("📊 خروجی اکسل کامل (CSV)", callback_data="snapp_export_csv"),
+            InlineKeyboardButton("📦 بکاپ کامل LocalStorage (JSON)", callback_data="snapp_export_json"),
         ],
         [
             InlineKeyboardButton("🔑 خروجی فقط لایسنس‌ها", callback_data="snapp_export_keys"),
             InlineKeyboardButton("📱 خروجی فقط شماره‌ها", callback_data="snapp_export_phones"),
         ],
         [
-            InlineKeyboardButton("📦 بکاپ کامل LocalStorage (JSON)", callback_data="snapp_export_json"),
-        ],
-        [
-            InlineKeyboardButton("🔍 راهنمای جستجو و حذف", callback_data="snapp_help"),
+            InlineKeyboardButton("🔍 راهنمای دستورات و سهمیه", callback_data="snapp_help"),
             InlineKeyboardButton("🗑 پاک‌سازی کل دیتابیس", callback_data="snapp_clear_confirm"),
         ],
     ])
@@ -218,7 +263,6 @@ def kb_back_to_main() -> InlineKeyboardMarkup:
 
 
 def is_admin(user_id: int) -> bool:
-    # اگر ALLOWED_USER_IDS در Railway خالی مانده باشد، برای جلوگیری از سکوت کامل ربات به همه ادمین‌ها اجازه می‌دهد
     if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
@@ -227,15 +271,16 @@ def is_admin(user_id: int) -> bool:
 def get_welcome_text() -> str:
     db = get_redis()
     records = fetch_all_snapp_records()
-    total = len(records)
+    partners = fetch_all_partners()
     db_badge = "🟢 متصل" if db else "🔴 قطع (متغیر REDIS_URL را بررسی کنید)"
     return (
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🚀 *پنل مدیریت حرفه‌ای لایسنس و دیتابیس اسنپ*\n"
+        "🚀 *پنل مدیریت حرفه‌ای لایسنس و سهمیه اسنپ*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📡 وضعیت دیتابیس ردیس: *{db_badge}*\n"
-        f"🗄 مجموع لایسنس‌های ثبت‌شده: `{total}`\n\n"
-        "از منوی زیر گزارش یا خروجی مورد نظر خود را انتخاب کنید:"
+        f"🗄 مجموع لایسنس‌های ثبت‌شده: `{len(records)}`\n"
+        f"👥 تعداد کدهای اشتراک دوستان: `{len(partners)}`\n\n"
+        "از منوی زیر گزارش، خروجی یا مدیریت سهمیه همکاران را انتخاب کنید:"
     )
 
 
@@ -252,6 +297,131 @@ async def start_snapp_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         get_welcome_text(),
         reply_markup=kb_snapp_admin(),
+        parse_mode="Markdown",
+    )
+
+
+async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ساخت کد اشتراک با محدودیت تعداد لایسنس برای دوست/همکار: /add_user Ali 50"""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    db = get_redis()
+    if not db:
+        await update.effective_message.reply_text("❌ دیتابیس ردیس متصل نیست!", parse_mode="Markdown")
+        return
+
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "⚠️ *راهنمای ساخت کد اشتراک با محدودیت تعداد:*\n\n"
+            "`/add_user نام_دوست تعداد_مجاز`\n\n"
+            "📌 *مثال (سهمیه ۵۰ لایسنس برای علی):*\n"
+            "`/add_user Ali 50`",
+            parse_mode="Markdown",
+        )
+        return
+
+    name = context.args[0].strip()
+    try:
+        limit = int(context.args[1].strip())
+        if limit <= 0:
+            raise ValueError()
+    except ValueError:
+        await update.effective_message.reply_text("⚠️ تعداد مجاز باید یک عدد صحیح مثبت باشد.", parse_mode="Markdown")
+        return
+
+    code = generate_partner_code()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    partner_data = {
+        "code": code,
+        "name": name,
+        "limit": limit,
+        "used": 0,
+        "active": True,
+        "created_at": now_str,
+    }
+    db.set(f"{PARTNER_PREFIX}{code}", json.dumps(partner_data, ensure_ascii=False))
+
+    msg = (
+        "✅ *کد اشتراک اختصاصی با موفقیت ساخته شد!*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 نام کاربر: `{name}`\n"
+        f"🔑 کد اشتراک: `{code}`\n"
+        f"🎯 سقف مجاز ساخت لایسنس: `{limit}` عدد\n"
+        f"📊 مصرف شده: `0 / {limit}`\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 این کد (`" + code + "`) را به دوستتان بدهید تا در بخش «🔑 کد اشتراک» بالای برنامه وارد کند."
+    )
+    await update.effective_message.reply_text(msg, parse_mode="Markdown")
+
+
+async def set_limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تغییر یا شارژ سقف مجاز یک کد اشتراک: /set_limit SUB-XXXXXX 100"""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    db = get_redis()
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "⚠️ *راهنمای تغییر سقف سهمیه:*\n`/set_limit SUB-XXXXXX 100`",
+            parse_mode="Markdown",
+        )
+        return
+
+    code = context.args[0].strip().upper()
+    try:
+        new_limit = int(context.args[1].strip())
+        if new_limit < 0:
+            raise ValueError()
+    except ValueError:
+        await update.effective_message.reply_text("⚠️ سقف جدید باید یک عدد صحیح باشد.", parse_mode="Markdown")
+        return
+
+    rk, pdata = get_partner_record(code)
+    if not rk or not pdata:
+        await update.effective_message.reply_text(f"❌ کد اشتراک `{code}` یافت نشد.", parse_mode="Markdown")
+        return
+
+    pdata["limit"] = new_limit
+    pdata["active"] = True
+    db.set(rk, json.dumps(pdata, ensure_ascii=False))
+    await update.effective_message.reply_text(
+        f"✅ سقف مجاز کاربر `{pdata.get('name')}` (`{code}`) به `{new_limit}` لایسنس تغییر یافت.\n"
+        f"📊 وضعیت فعلی: `{pdata.get('used', 0)} / {new_limit}`",
+        parse_mode="Markdown",
+    )
+
+
+async def block_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مسدود یا حذف کردن کد اشتراک دوست: /block_user SUB-XXXXXX"""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+
+    db = get_redis()
+    if not context.args:
+        await update.effective_message.reply_text(
+            "⚠️ *راهنمای مسدودسازی کد اشتراک:*\n`/block_user SUB-XXXXXX`",
+            parse_mode="Markdown",
+        )
+        return
+
+    code = context.args[0].strip().upper()
+    rk, pdata = get_partner_record(code)
+    if not rk or not pdata:
+        await update.effective_message.reply_text(f"❌ کد اشتراک `{code}` یافت نشد.", parse_mode="Markdown")
+        return
+
+    pdata["active"] = False
+    db.set(rk, json.dumps(pdata, ensure_ascii=False))
+    await update.effective_message.reply_text(
+        f"🚫 دسترسی کد اشتراک `{code}` متعلق به `{pdata.get('name')}` مسدود شد.\n"
+        f"برای فعال‌سازی مجدد می‌توانید از دستور `/set_limit {code} {pdata.get('limit', 50)}` استفاده کنید.",
         parse_mode="Markdown",
     )
 
@@ -277,6 +447,7 @@ async def get_license_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r for r in records
         if r.get("license_key", "").lower() == query_str.lower()
         or r.get("phone_number", "") == query_str
+        or r.get("partner_code", "").lower() == query_str.lower()
     ]
 
     if not matched:
@@ -287,6 +458,7 @@ async def get_license_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lic = item.get("license_key", "-")
         phone = item.get("phone_number", "نامشخص")
         created = item.get("created_at", "-")
+        partner_name = item.get("partner_name", "ادمین")
         storage_str = item.get("local_storage", "{}")
 
         doc = io.BytesIO(storage_str.encode("utf-8"))
@@ -295,6 +467,7 @@ async def get_license_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔍 *اطلاعات لایسنس یافت‌شده:*\n\n"
             f"🔑 لایسنس: `{lic}`\n"
             f"📱 شماره: `{phone}`\n"
+            f"👤 سازنده: `{partner_name}`\n"
             f"⏰ زمان ثبت: `{created}`\n"
             f"🗑 حذف سریع: `/delete {lic}`"
         )
@@ -357,6 +530,7 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today_prefix = datetime.now().strftime("%Y-%m-%d")
         today_count = sum(1 for r in records if str(r.get("created_at", "")).startswith(today_prefix))
         latest_time = records[0].get("created_at", "-") if records else "بدون رکورد"
+        partners = fetch_all_partners()
 
         text = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -365,9 +539,43 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🗂 کل لایسنس‌های موجود: `{total}`\n"
             f"📱 شماره‌های یکتای شناسایی‌شده: `{len(known_phones)}`\n"
             f"📅 لایسنس‌های ثبت‌شده امروز: `{today_count}`\n"
+            f"👥 تعداد همکاران/دوستان تعریف‌شده: `{len(partners)}`\n"
             f"🕓 آخرین ثبت: `{latest_time}`\n"
         )
         await query.edit_message_text(text, reply_markup=kb_back_to_main(), parse_mode="Markdown")
+
+    elif data_cb == "snapp_partners":
+        await query.answer()
+        partners = fetch_all_partners()
+        lines = [
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            "👥 *مدیریت سهمیه دوستان و همکاران*",
+            "━━━━━━━━━━━━━━━━━━━━━━\n",
+        ]
+        if not partners:
+            lines.append("هنوز هیچ کد اشتراکی نساخته‌اید.\n")
+        else:
+            for idx, p in enumerate(partners, start=1):
+                status_icon = "🟢 فعال" if p.get("active", True) else "🔴 مسدود"
+                used = p.get("used", 0)
+                limit = p.get("limit", 0)
+                rem = max(0, limit - used)
+                lines.append(
+                    f"{idx}. 👤 *{p.get('name')}* (`{p.get('code')}`)\n"
+                    f"   ├ وضعیت: {status_icon}\n"
+                    f"   └ مصرف‌شده: `{used} / {limit}` (باقی‌مانده: `{rem}`)\n"
+                )
+
+        lines.append("📌 *دستورات مدیریت سهمیه:*")
+        lines.append("➕ ساخت کد جدید:\n`/add_user Ali 50`")
+        lines.append("🔄 تغییر سقف سهمیه:\n`/set_limit SUB-XXXXXX 100`")
+        lines.append("🚫 مسدود کردن کد:\n`/block_user SUB-XXXXXX`")
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=kb_back_to_main(),
+            parse_mode="Markdown",
+        )
 
     elif data_cb == "snapp_list_inline":
         if not records:
@@ -384,7 +592,9 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for idx, r in enumerate(records[:preview_limit], start=1):
             lic = r.get("license_key", "-")
             phone = r.get("phone_number", "نامشخص")
-            lines.append(f"{idx}. 📱 `{phone}` ➔ `{lic}`")
+            pname = r.get("partner_name", "")
+            ptag = f" ({pname})" if pname else ""
+            lines.append(f"{idx}. 📱 `{phone}` ➔ `{lic}`{ptag}")
 
         if len(records) > preview_limit:
             lines.append(f"\n💡 _برای مشاهده تمام {len(records)} مورد، دکمه «گزارش لایسنس + شماره (TXT)» را بزنید._")
@@ -411,15 +621,16 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for idx, r in enumerate(records, start=1):
             lic = r.get("license_key", "-")
             phone = r.get("phone_number", "نامشخص")
+            pname = r.get("partner_name", "آزاد/ادمین")
             created = r.get("created_at", "-")
-            lines.append(f"[{idx}] شماره: {phone} | لایسنس: {lic} | زمان: {created}")
+            lines.append(f"[{idx}] شماره: {phone} | لایسنس: {lic} | سازنده: {pname} | زمان: {created}")
 
         doc = io.BytesIO("\n".join(lines).encode("utf-8"))
         doc.name = f"Snapp_License_Phone_Report_{now_tag}.txt"
         await query.message.reply_document(
             doc,
             caption=(
-                "📄 *گزارش کامل لایسنس‌ها به همراه شماره موبایل*\n"
+                "📄 *گزارش کامل لایسنس‌ها به همراه شماره موبایل و نام سازنده*\n"
                 f"🔢 تعداد کل: `{len(records)}`"
             ),
             parse_mode="Markdown",
@@ -469,12 +680,14 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⏳ در حال تولید فایل CSV (اکسل)...")
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["ردیف", "کلید لایسنس", "شماره موبایل", "تعداد کلیدهای LocalStorage", "زمان ثبت"])
+        writer.writerow(["ردیف", "کلید لایسنس", "شماره موبایل", "سازنده (همکار)", "کد اشتراک", "تعداد کلیدهای LocalStorage", "زمان ثبت"])
         for idx, r in enumerate(records, start=1):
             writer.writerow([
                 idx,
                 r.get("license_key", ""),
                 r.get("phone_number", "نامشخص"),
+                r.get("partner_name", "ادمین"),
+                r.get("partner_code", "-"),
                 r.get("storage_keys_count", "-"),
                 r.get("created_at", ""),
             ])
@@ -483,7 +696,7 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc.name = f"Snapp_Report_{now_tag}.csv"
         await query.message.reply_document(
             doc,
-            caption=f"📊 *فایل اکسل (CSV) گزارش لایسنس‌ها و شماره‌ها*\n🔢 تعداد: `{len(records)}`",
+            caption=f"📊 *فایل اکسل (CSV) گزارش لایسنس‌ها، شماره‌ها و سهمیه همکاران*\n🔢 تعداد: `{len(records)}`",
             parse_mode="Markdown",
         )
 
@@ -509,15 +722,20 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         help_text = (
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔍 *راهنمای دستورات مدیریتی ربات*\n"
+            "🔍 *راهنمای دستورات مدیریتی و سهمیه‌بندی*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "1️⃣ *جستجوی لایسنس یا شماره موبایل:*\n"
+            "1️⃣ *تعریف کد اشتراک برای دوست با سقف تعداد:*\n"
+            "`/add_user Ali 50`\n\n"
+            "2️⃣ *افزایش یا تغییر سقف سهمیه دوست:*\n"
+            "`/set_limit SUB-XXXXXX 120`\n\n"
+            "3️⃣ *مسدود کردن کد اشتراک دوست:*\n"
+            "`/block_user SUB-XXXXXX`\n\n"
+            "4️⃣ *جستجوی لایسنس، شماره یا کد همکار:*\n"
             "`/get Snapp-XXXX-XXXX`\n"
-            "`/get 09123456789`\n\n"
-            "2️⃣ *حذف یک لایسنس مشخص:*\n"
-            "`/delete Snapp-XXXX-XXXX`\n\n"
-            "3️⃣ *باز کردن پنل مدیریت:*\n"
-            "`/start` یا `/admin`"
+            "`/get 09123456789`\n"
+            "`/get SUB-XXXXXX`\n\n"
+            "5️⃣ *حذف یک لایسنس مشخص:*\n"
+            "`/delete Snapp-XXXX-XXXX`"
         )
         await query.edit_message_text(help_text, reply_markup=kb_back_to_main(), parse_mode="Markdown")
 
@@ -548,29 +766,30 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ======================== راه‌اندازی ربات داخل چرخه حیات FastAPI (مخصوص Railway) ========================
+# ======================== راه‌اندازی ربات داخل چرخه حیات FastAPI ========================
 tg_application = None
 
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
-    """راه‌اندازی خودکار ربات تلگرام همزمان با بالا آمدن وب‌سرور در Railway (حتی اگر با uvicorn اجرا شود)."""
     global tg_application
     if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "توکن_ربات_اسنپ_را_اینجا_بگذارید":
         try:
             tg_application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
             tg_application.add_handler(CommandHandler("start", start_snapp_bot))
             tg_application.add_handler(CommandHandler("admin", start_snapp_bot))
+            tg_application.add_handler(CommandHandler("add_user", add_user_cmd))
+            tg_application.add_handler(CommandHandler("set_limit", set_limit_cmd))
+            tg_application.add_handler(CommandHandler("block_user", block_user_cmd))
             tg_application.add_handler(CommandHandler("get", get_license_cmd))
             tg_application.add_handler(CommandHandler("delete", delete_snapp_license))
             tg_application.add_handler(CallbackQueryHandler(snapp_callbacks, pattern="^snapp_"))
 
             await tg_application.initialize()
-            # پاک کردن وبهوک قبلی در صورت وجود تا Polling بدون تداخل کار کند
             await tg_application.bot.delete_webhook(drop_pending_updates=True)
             await tg_application.start()
             await tg_application.updater.start_polling(drop_pending_updates=True)
-            logger.info("🤖 ربات مدیریت اسنپ با موفقیت روی Railway استارت شد!")
+            logger.info("🤖 ربات مدیریت اسنپ و سهمیه‌بندی با موفقیت استارت شد!")
         except Exception as e:
             logger.error(f"❌ خطا در استارت ربات تلگرام: {e}")
     else:
@@ -592,9 +811,10 @@ class SnappData(BaseModel):
     cookies: str = "empty"
     local_storage: str
     phone_number: str = "unknown"
+    partner_code: str = ""
 
 
-app = FastAPI(title="Snapp License & Storage API", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="Snapp License & Quota API", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -603,6 +823,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/snapp/partner-status/{partner_code}")
+async def check_partner_status(partner_code: str):
+    """بررسی وضعیت و سهمیه باقی‌مانده کد اشتراک همکار از داخل برنامه اندروید."""
+    rk, pdata = get_partner_record(partner_code)
+    if not rk or not pdata:
+        raise HTTPException(status_code=404, detail="کد اشتراک یافت نشد")
+    used = int(pdata.get("used", 0))
+    limit = int(pdata.get("limit", 0))
+    return {
+        "success": True,
+        "name": pdata.get("name", "همکار"),
+        "code": pdata.get("code"),
+        "active": bool(pdata.get("active", True)),
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+    }
 
 
 @app.post("/api/snapp/create-license")
@@ -615,6 +854,44 @@ async def create_snapp_license(data: SnappData):
     raw_storage = (data.local_storage or "").strip()
     if not raw_storage or raw_storage == "{}":
         raise HTTPException(status_code=400, detail="LocalStorage is empty")
+
+    # بررسی کد اشتراک و سهمیه در صورت وجود کد اشتراک در دیتابیس
+    partner_code = (data.partner_code or "").strip().upper()
+    existing_partners = db.keys(f"{PARTNER_PREFIX}*")
+
+    partner_name = "ادمین / آزاد"
+    quota_used = 0
+    quota_limit = 0
+    quota_remaining = -1
+
+    if partner_code or (REQUIRE_PARTNER_CODE and len(existing_partners) > 0):
+        if not partner_code:
+            raise HTTPException(
+                status_code=403,
+                detail="لطفاً ابتدا کد اشتراک (سهمیه) خود را در بالای برنامه وارد کنید.",
+            )
+        rk, pdata = get_partner_record(partner_code)
+        if not rk or not pdata:
+            raise HTTPException(status_code=403, detail="کد اشتراک وارد شده نامعتبر است.")
+        if not pdata.get("active", True):
+            raise HTTPException(status_code=403, detail="این کد اشتراک توسط مدیریت مسدود شده است.")
+
+        used = int(pdata.get("used", 0))
+        limit = int(pdata.get("limit", 0))
+        if used >= limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"سهمیه ساخت لایسنس شما به پایان رسیده است ({used}/{limit}). جهت شارژ مجدد با مدیر هماهنگ کنید.",
+            )
+
+        used += 1
+        pdata["used"] = used
+        db.set(rk, json.dumps(pdata, ensure_ascii=False))
+
+        partner_name = pdata.get("name", "همکار")
+        quota_used = used
+        quota_limit = limit
+        quota_remaining = max(0, limit - used)
 
     license_key = generate_snapp_license()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -632,6 +909,8 @@ async def create_snapp_license(data: SnappData):
         "local_storage": raw_storage,
         "cookies": data.cookies or "empty",
         "storage_keys_count": storage_keys_count,
+        "partner_code": partner_code or "-",
+        "partner_name": partner_name,
         "created_at": now_str,
     }
 
@@ -643,6 +922,11 @@ async def create_snapp_license(data: SnappData):
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "توکن_ربات_اسنپ_را_اینجا_بگذارید":
         bot = tg_application.bot if tg_application else Bot(token=TELEGRAM_BOT_TOKEN)
+        quota_line = (
+            f"👤 سازنده: `{partner_name}` (`{quota_used}/{quota_limit}` - باقی‌مانده: `{quota_remaining}`)\n"
+            if quota_limit > 0
+            else f"👤 سازنده: `{partner_name}`\n"
+        )
         for admin_id in ALLOWED_USER_IDS:
             try:
                 msg = (
@@ -651,6 +935,7 @@ async def create_snapp_license(data: SnappData):
                     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"🔑 لایسنس: `{license_key}`\n"
                     f"📱 شماره موبایل: `{detected_phone}`\n"
+                    f"{quota_line}"
                     f"🗂 تعداد کلیدهای LocalStorage: `{storage_keys_count}`\n"
                     f"⏰ زمان ثبت: `{now_str}`\n\n"
                     "✅ اطلاعات LocalStorage با موفقیت در ردیس ذخیره شد."
@@ -664,6 +949,10 @@ async def create_snapp_license(data: SnappData):
             "success": True,
             "license_key": license_key,
             "phone_number": detected_phone,
+            "partner_name": partner_name,
+            "quota_used": quota_used,
+            "quota_limit": quota_limit,
+            "quota_remaining": quota_remaining,
             "message": "Snapp license created successfully",
         }
     )
