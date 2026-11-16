@@ -43,9 +43,6 @@ ALLOWED_USER_IDS = [
     int(x.strip()) for x in re.split(r"[,\s]+", allowed_users_env) if x.strip().isdigit()
 ]
 
-# اگر REQUIRE_PARTNER_CODE برابر false باشد، بدون کد اشتراک هم می‌توان لایسنس ساخت؛ به صورت پیش‌فرض برای امنیت سهمیه فعال است
-REQUIRE_PARTNER_CODE = os.getenv("REQUIRE_PARTNER_CODE", "true").lower() != "false"
-
 REDIS_URL = os.getenv("REDIS_URL")
 PORT = int(os.getenv("PORT", 8000))
 REDIS_PREFIX = "snapp:license:"
@@ -352,7 +349,7 @@ async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎯 سقف مجاز ساخت لایسنس: `{limit}` عدد\n"
         f"📊 مصرف شده: `0 / {limit}`\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 این کد (`" + code + "`) را به دوستتان بدهید تا در بخش «🔑 کد اشتراک» بالای برنامه وارد کند."
+        "💡 بدون وارد کردن این کد در برنامه، امکان صدور هیچ لایسنسی وجود ندارد."
     )
     await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
@@ -397,7 +394,7 @@ async def set_limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def block_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مسدود یا حذف کردن کد اشتراک دوست: /block_user SUB-XXXXXX"""
+    """مسدود کردن کد اشتراک دوست: /block_user SUB-XXXXXX"""
     if not update.effective_message or not update.effective_user:
         return
     if not is_admin(update.effective_user.id):
@@ -458,7 +455,7 @@ async def get_license_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lic = item.get("license_key", "-")
         phone = item.get("phone_number", "نامشخص")
         created = item.get("created_at", "-")
-        partner_name = item.get("partner_name", "ادمین")
+        partner_name = item.get("partner_name", "نامشخص")
         storage_str = item.get("local_storage", "{}")
 
         doc = io.BytesIO(storage_str.encode("utf-8"))
@@ -621,7 +618,7 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for idx, r in enumerate(records, start=1):
             lic = r.get("license_key", "-")
             phone = r.get("phone_number", "نامشخص")
-            pname = r.get("partner_name", "آزاد/ادمین")
+            pname = r.get("partner_name", "-")
             created = r.get("created_at", "-")
             lines.append(f"[{idx}] شماره: {phone} | لایسنس: {lic} | سازنده: {pname} | زمان: {created}")
 
@@ -686,7 +683,7 @@ async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 idx,
                 r.get("license_key", ""),
                 r.get("phone_number", "نامشخص"),
-                r.get("partner_name", "ادمین"),
+                r.get("partner_name", "-"),
                 r.get("partner_code", "-"),
                 r.get("storage_keys_count", "-"),
                 r.get("created_at", ""),
@@ -851,47 +848,46 @@ async def create_snapp_license(data: SnappData):
     if not db:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
+    # الزام قطعی به وارد کردن کد اشتراک معتبر قبل از صدور هرگونه لایسنس
+    partner_code = (data.partner_code or "").strip().upper()
+    if not partner_code:
+        raise HTTPException(
+            status_code=403,
+            detail="بدون وارد کردن کد اشتراک امکان صدور لایسنس وجود ندارد. ابتدا کد اشتراک خود را در بالای برنامه ثبت کنید.",
+        )
+
+    rk, pdata = get_partner_record(partner_code)
+    if not rk or not pdata:
+        raise HTTPException(
+            status_code=403,
+            detail="کد اشتراک وارد شده معتبر نیست. لطفاً کد صحیح را از مدیر دریافت کنید.",
+        )
+    if not pdata.get("active", True):
+        raise HTTPException(
+            status_code=403,
+            detail="این کد اشتراک توسط مدیریت غیرفعال شده است.",
+        )
+
+    used = int(pdata.get("used", 0))
+    limit = int(pdata.get("limit", 0))
+    if used >= limit:
+        raise HTTPException(
+            status_code=403,
+            detail=f"سهمیه ساخت لایسنس شما به پایان رسیده است ({used}/{limit}). جهت شارژ مجدد با مدیر هماهنگ کنید.",
+        )
+
     raw_storage = (data.local_storage or "").strip()
     if not raw_storage or raw_storage == "{}":
-        raise HTTPException(status_code=400, detail="LocalStorage is empty")
+        raise HTTPException(status_code=400, detail="LocalStorage خالی است؛ ابتدا وارد حساب اسنپ شوید.")
 
-    # بررسی کد اشتراک و سهمیه در صورت وجود کد اشتراک در دیتابیس
-    partner_code = (data.partner_code or "").strip().upper()
-    existing_partners = db.keys(f"{PARTNER_PREFIX}*")
+    used += 1
+    pdata["used"] = used
+    db.set(rk, json.dumps(pdata, ensure_ascii=False))
 
-    partner_name = "ادمین / آزاد"
-    quota_used = 0
-    quota_limit = 0
-    quota_remaining = -1
-
-    if partner_code or (REQUIRE_PARTNER_CODE and len(existing_partners) > 0):
-        if not partner_code:
-            raise HTTPException(
-                status_code=403,
-                detail="لطفاً ابتدا کد اشتراک (سهمیه) خود را در بالای برنامه وارد کنید.",
-            )
-        rk, pdata = get_partner_record(partner_code)
-        if not rk or not pdata:
-            raise HTTPException(status_code=403, detail="کد اشتراک وارد شده نامعتبر است.")
-        if not pdata.get("active", True):
-            raise HTTPException(status_code=403, detail="این کد اشتراک توسط مدیریت مسدود شده است.")
-
-        used = int(pdata.get("used", 0))
-        limit = int(pdata.get("limit", 0))
-        if used >= limit:
-            raise HTTPException(
-                status_code=403,
-                detail=f"سهمیه ساخت لایسنس شما به پایان رسیده است ({used}/{limit}). جهت شارژ مجدد با مدیر هماهنگ کنید.",
-            )
-
-        used += 1
-        pdata["used"] = used
-        db.set(rk, json.dumps(pdata, ensure_ascii=False))
-
-        partner_name = pdata.get("name", "همکار")
-        quota_used = used
-        quota_limit = limit
-        quota_remaining = max(0, limit - used)
+    partner_name = pdata.get("name", "همکار")
+    quota_used = used
+    quota_limit = limit
+    quota_remaining = max(0, limit - used)
 
     license_key = generate_snapp_license()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -909,7 +905,7 @@ async def create_snapp_license(data: SnappData):
         "local_storage": raw_storage,
         "cookies": data.cookies or "empty",
         "storage_keys_count": storage_keys_count,
-        "partner_code": partner_code or "-",
+        "partner_code": partner_code,
         "partner_name": partner_name,
         "created_at": now_str,
     }
@@ -922,11 +918,6 @@ async def create_snapp_license(data: SnappData):
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "توکن_ربات_اسنپ_را_اینجا_بگذارید":
         bot = tg_application.bot if tg_application else Bot(token=TELEGRAM_BOT_TOKEN)
-        quota_line = (
-            f"👤 سازنده: `{partner_name}` (`{quota_used}/{quota_limit}` - باقی‌مانده: `{quota_remaining}`)\n"
-            if quota_limit > 0
-            else f"👤 سازنده: `{partner_name}`\n"
-        )
         for admin_id in ALLOWED_USER_IDS:
             try:
                 msg = (
@@ -935,7 +926,8 @@ async def create_snapp_license(data: SnappData):
                     "━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"🔑 لایسنس: `{license_key}`\n"
                     f"📱 شماره موبایل: `{detected_phone}`\n"
-                    f"{quota_line}"
+                    f"👤 سازنده: `{partner_name}` (`{partner_code}`)\n"
+                    f"📊 سهمیه مصرف‌شده: `{quota_used}/{quota_limit}` (باقی‌مانده: `{quota_remaining}`)\n"
                     f"🗂 تعداد کلیدهای LocalStorage: `{storage_keys_count}`\n"
                     f"⏰ زمان ثبت: `{now_str}`\n\n"
                     "✅ اطلاعات LocalStorage با موفقیت در ردیس ذخیره شد."
